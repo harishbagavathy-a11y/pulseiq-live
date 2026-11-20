@@ -1,0 +1,71 @@
+name: Automated Monthly Data Refresh Pipeline
+
+on:
+  schedule:
+    # Runs at 06:00 UTC on the 1st of every month (matching monthly FP&A book close)
+    - cron: '0 6 1 * *'
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Manual refresh justification'
+        required: false
+        default: 'Ad-hoc Board Executive Review'
+
+concurrency:
+  group: scheduled-refresh
+  cancel-in-progress: true
+
+jobs:
+  refresh-and-publish:
+    name: Execute Governed Semantic Aggregation & Live Push
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 1. Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
+
+      - name: 2. Set Up Python Runtime
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 3. Install Production Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 4. Verify Zero Secrets in Repository
+        run: |
+          python -m unittest tests/test_no_secrets.py
+
+      - name: 5. Execute Privacy-Preserving Refresh Pipeline
+        env:
+          APP_ENVIRONMENT: production
+          STREAMLIT_SECRETS_AVAILABLE: "true"
+        run: |
+          python src/scheduled_refresh.py --source "GitHub_Actions_Cron_${{ github.run_id }}"
+
+      - name: 6. Run Quality & Data Cut-Off Audit Tests
+        run: |
+          python -m unittest discover -s tests -p "test_*.py"
+
+      - name: 7. Commit & Push Updated Parquet Aggregates
+        run: |
+          git config --local user.name "PulseIQ Automated Data Bot"
+          git config --local user.email "bot@pulseiq.internal"
+          git add data/parquet/*.parquet data/pulseiq_live_dw.db data/metadata.json
+          
+          # Only commit if changes exist
+          if git diff --staged --quiet; then
+            echo "No data changes detected. Warehouse aggregates are up to date."
+          else
+            TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+            git commit -m "chore(data): automated monthly warehouse refresh [$TIMESTAMP] [skip ci]"
+            git push origin main
+            echo "Pushed updated aggregates to main. Streamlit Community Cloud redeployment triggered."
+          fi
